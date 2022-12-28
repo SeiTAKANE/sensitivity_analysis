@@ -1,0 +1,147 @@
+---
+title: "偏決定係数(Partial R square)を用いたRによる感度分析"
+author: "SeiTAKANE"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## セットアップと感度分析の概要
+<br>
+
+```{r dag, echo=FALSE}
+pacman::p_load(dagitty,ggdag
+               )
+```
+
+- 使用パッケージ
+```{r setup}
+pacman::p_load(sensemakr,#感度分析用
+               cobalt, #サンプルデータセット
+               tidyverse #データ整形、可視化
+               )
+```
+<br>
+
+- 使用データ
+  - 使用するデータ: 米国における職業訓練を受けたかどうか(treat)とその後の所得(re78)の観察データ(lalonde)。属性情報（教育、人種など）が含まれている。
+  - 通常はマッチング推定の例題としてよく用いられるが、今回は簡易化のためマッチングは行わない。
+  - データ引用元: [cobalt](https://ngreifer.github.io/cobalt/reference/lalonde.html)よりダウンロード。パラメータの詳細はアクセス先に詳しい。
+```{r data }
+#使用するデータセット
+lalonde <-  lalonde　#cobaltパッケージに内装のlolandeデータセット
+
+#人種ダミーの作成
+lalonde <- lalonde %>%
+  mutate(white    = if_else(race == "white",  1, 0),
+         black    = if_else(race == "black",  1, 0),
+         hispanic = if_else(race == "hispan", 1, 0))
+
+#データの概要
+summary(lalonde) 
+```
+<br>
+
+- 感度分析が想定する状況(dagによる説明)
+  - Xは主たる説明変数(lolandではtreat)。
+  - Yは被説明変数(lolandではre78)。
+  - Zは統制変数(lolandではage,educ,black,hispanic,married,nodegree,re74,re75)。
+  - Uは未観測の交絡因子。
+  - モデルは未観測の交絡因子Uによってバイアスを受ける。
+```{r dag_2,eval = TRUE, echo = FALSE }
+md_dag <- dagitty("dag{X -> Y; Z -> X; Z -> Y;
+                  U -> Y; U -> X;}")
+coordinates(md_dag) <- list(x = c(X = 7, Z = 5, U = 2, Y=0),
+                           y = c(X = 0, Z = 1, U = 1, Y = 0))
+
+plot1 <- ggdag_classic(md_dag,size = 4)+
+  theme_dag_blank()+
+  labs(title = "Dag for sensitivity analysis")
+plot(plot1)
+```
+<br>
+
+- 感度分析が想定する状況(モデルによる説明)
+  - 簡易化のため、単純なOLSを想定（均一分散）。
+<br>
+$$
+\begin{aligned}
+Y_i     & = \beta_1 X_i + \mathbf{\beta_2}\mathbf{Z_i} + \mathbf{\beta_3}\mathbf{{U_i}} + \gamma_i, \\
+ \gamma_i     & \sim \text{Normal} (0, \sigma^2_{\gamma_i})
+\end{aligned}
+$$
+```{r model}
+#回帰分析
+reg <- lm(re78 ~ treat+　age + educ + black + hispanic + married +nodegree + re74+ re75,data = lalonde)
+
+#結果の描写
+summary(reg)
+```
+<br>
+
+## 偏決定係数を使った感度分析とRによる実装
+<br>
+
+- RVの算出
+  - Robustness value(RV)の算出:         
+    RVとは、説明変数の被説明変数に対する限界効果を減少させる未観測
+    の交絡因子が説明変数と被説明変数の双方に与える影響の閾値（どれ
+    だけ効果を減少させるのかは、後述するqで設定する、通常は0にすることが多い）。
+  - 出力結果の解釈: Robustness... q=1:に続く部分がRVの算出結果ここでは、未観測要因(U)が説明変数(X)と被説明変数(Υ)に対して0.0774の偏決定係数を持てば、XのYに対する限界効果が統計的にゼロになる。
+  - モデルがUにどれくらいの侵害を受けるのかは、後述。
+  
+```{r rv}
+#rvの算出
+lalonde_sensitivity <- sensemakr(model = reg, #感度分析にかけるモデル
+                                treatment = "treat",#主たる説明変数
+                                benchmark_covariates = c("educ"),#ベンチマーク共変量、今回は教育年数を採用
+                                q = 1,#RVにおける主たる説明変数を減少させる割合（100*q）%で設定、今回は限界効果をゼロにする値
+                                kd = 1:3,　#ベンチマークテスト用の説明変数への偏決定係数のシミュレーション倍率(*1~*3でシミュレーション)
+                                ky = 1:3　#ベンチマークテスト用の被説明変数への偏決定係数のシミュレーション倍率(*1~*3でシミュレーション)
+)
+
+#結果の出力
+summary(lalonde_sensitivity)
+```
+<br>
+
+- 偏決定係数(Partial r square)とは
+  - UのYに対する偏決定係数: Uがない場合のモデルのYの残差のうちUが説明できる部分の割合。
+  - UのXに対する偏決定係数:
+Uがない場合の共変量をXに回帰した際のモデルの残差のうちUが説明できる部分。
+$$
+\begin{aligned}
+R^2_{Y \sim U|X,Z} &= \frac{R^2_{Y \sim X+Z+U} - R^2_{Y \sim X+Z}}{1 - R^2_{Y \sim X+Z}}, \\
+R^2_{X \sim U|Z} &= \frac{R^2_{X \sim Z+U} - R^2_{Y \sim Z}}{1 - R^2_{X \sim Z}},
+\end{aligned}
+$$
+<br>
+
+- ベンチマークテスト
+  - Uは分析者は観察できないので、代わりに観察できる共変量（ベンチマーク共変量を使う）。
+  - ベンチマーク共変量のXとYに対する偏決定係数とRVを比較することにより、モデルがUの影響をどれだけ受けやすいのか解釈を行う。
+  - 比較・解釈は客観的な基準値はなく、あくまでドメイン知識に依存。
+  - 今回は例として、教育年数(educ)を使用(理論的な妥当性はここでは考慮しない)。
+  - 出力結果のBounds on omitted variable bias:に注目。教育年数の説明変数に対する偏決定係数は0.01,被説明変数に対する偏決定係数は0.109、それを3倍してもRVには届かない。
+  - つまり、未観測要因は説明変数と被説明変数に対する影響が教育年数の3倍大きかったとしても、説明変数の被説明変数に対する限界効果は統計的にはゼロにならない。
+  
+<br>
+```{r bm}
+#先ほどの結果をもう一度出力
+summary(lalonde_sensitivity)
+```
+<br>
+
+- ベンチマークテスト（可視化）
+  - 上で行った、ベンチママークテストは、contour plot やシナリオプロットで可視化するとより視覚的に理解可能。
+```{r bm_visu}
+#contour plotでのベンチマークテストの可視化:赤がRV
+plot(lalonde_sensitivity)
+
+#シナリオプロットでのベンチマークテストの可視化:赤がRV
+plot(lalonde_sensitivity, type = "extreme")
+```
+<br>
+
+ - 参考文献は以下 <br>
+  ・[An introduction to sensitivity analysis](https://cran.r-project.org/web/packages/sensemakr/vignettes/sensemakr.html) <br>
+  ・[Making Sense of Sensitivity: Extending Omitted Variable Bias](https://carloscinelli.com/files/Cinelli%20and%20Hazlett%20(2020)%20-%20Making%20Sense%20of%20Sensitivity.pdf)
